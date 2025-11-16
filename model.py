@@ -255,8 +255,11 @@ class DiffusionTransformer(nn.Module):
         """
         if device is None:
             device = self.get_device()
+        max_steps = self.config.diffusion_steps
         if num_steps is None:
-            num_steps = seq_len  # Maximum possible steps
+            num_steps = max_steps
+        else:
+            num_steps = min(num_steps, max_steps)
 
         # Start from all mask tokens
         x = torch.full(
@@ -339,8 +342,11 @@ class DiffusionTransformer(nn.Module):
         """
         if device is None:
             device = self.get_device()
+        max_steps = self.config.diffusion_steps
         if num_steps is None:
-            num_steps = seq_len  # Maximum possible steps
+            num_steps = max_steps
+        else:
+            num_steps = min(num_steps, max_steps)
 
         # Start from all mask tokens
         x = torch.full(
