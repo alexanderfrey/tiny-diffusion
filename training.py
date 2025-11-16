@@ -102,17 +102,21 @@ def get_data_loader(data_path, batch_size, seq_len, device):
     # Convert to tokens
     tokens = encode_text(text)
 
-    # Create batches
-    num_batches = len(tokens) // (batch_size * seq_len)
-    tokens = tokens[: num_batches * batch_size * seq_len]
-    tokens = tokens.view(batch_size, -1)
+    # Determine max starting index for sampling
+    max_start = len(tokens) - seq_len
+    if max_start <= 0:
+        raise ValueError("Dataset is too small for the requested sequence length.")
+    arange_seq = torch.arange(seq_len, dtype=torch.long)
 
     # Generator function
     def data_generator():
         while True:
-            for i in range(0, tokens.size(1) - seq_len, seq_len):
-                batch = tokens[:, i : i + seq_len].to(device)
-                yield batch
+            start_indices = torch.randint(
+                0, max_start + 1, (batch_size,), dtype=torch.long
+            )
+            positions = start_indices.unsqueeze(1) + arange_seq
+            batch = tokens[positions].to(device)
+            yield batch
 
     return data_generator()
 
