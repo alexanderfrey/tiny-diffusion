@@ -26,7 +26,13 @@ class MaskedDiffusionSchedule:
         self.context_len = context_len
 
         # Linear schedule: probability of masking increases linearly
-        self.mask_probs = torch.linspace(1.0 / num_timesteps, 1.0, num_timesteps)
+        self.mask_probs = torch.linspace(
+            1.0 / num_timesteps, 1.0, num_timesteps, dtype=torch.float32
+        )
+
+    def to(self, device):
+        self.mask_probs = self.mask_probs.to(device)
+        return self
 
     def add_masks(self, x_0, t):
         """
@@ -40,18 +46,38 @@ class MaskedDiffusionSchedule:
         B, T = x_0.shape
         device = x_0.device
 
-        # Get masking probability for each sample (index on CPU, then move to device)
-        mask_prob = self.mask_probs[t.cpu()].to(device)  # (B,)
+        # Keep schedule tensor on the same device as data
+        if self.mask_probs.device != device:
+            self.mask_probs = self.mask_probs.to(device)
+
+        # Get masking probability for each sample
+        mask_prob = self.mask_probs[t]  # (B,)
 
         # Create mask: which tokens to replace with [MASK]
         mask = torch.rand(B, T, device=device) < mask_prob.unsqueeze(1)  # (B, T)
 
         # Never mask the first context_len tokens
-        if self.context_len > 0:
-            mask[:, : self.context_len] = False
+        protected = min(self.context_len, T)
+        if protected > 0:
+            mask[:, :protected] = False
+
+        # Ensure each sequence has at least one masked (non-context) position
+        valid_start = protected
+        if valid_start >= T:
+            raise ValueError(
+                "context_len must be smaller than sequence_len to allow masking tokens."
+            )
+        no_mask_rows = mask[:, valid_start:].sum(dim=1) == 0
+        if no_mask_rows.any():
+            rows = torch.nonzero(no_mask_rows, as_tuple=False).squeeze(1)
+            rand_positions = torch.randint(
+                valid_start, T, (rows.size(0),), device=device
+            )
+            mask[rows, rand_positions] = True
 
         # Replace masked positions with mask token
-        x_t = torch.where(mask, self.mask_token_id, x_0)
+        mask_tokens = torch.full_like(x_0, self.mask_token_id)
+        x_t = torch.where(mask, mask_tokens, x_0)
 
         return x_t
 
@@ -119,9 +145,9 @@ def train_step(model, x_0, mask_schedule, optimizer):
     loss = F.cross_entropy(
         logits.view(-1, logits.size(-1)), x_0.view(-1), reduction="none"
     )
-    loss = (
-        loss.view(B, -1) * mask
-    ).sum() / mask.sum()  # Average over masked positions only
+    masked_loss = loss.view(B, -1) * mask.float()
+    denom = mask.sum().clamp_min(1)
+    loss = masked_loss.sum() / denom  # Average over masked positions only
 
     # Backward pass
     optimizer.zero_grad()
@@ -218,7 +244,7 @@ def main():
         num_timesteps=config.diffusion_steps,
         mask_token_id=config.mask_token_id,
         context_len=config.context_len,
-    )
+    ).to(device)
 
     # Optimizer
     optimizer = torch.optim.AdamW(
