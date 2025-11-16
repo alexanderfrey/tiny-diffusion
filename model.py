@@ -36,9 +36,18 @@ class DiffusionConfig:
     context_len: int = 16  # Number of prefix tokens that are never masked
 
 
-def norm(x):
-    # Purely functional rmsnorm with no learnable params
-    return F.rms_norm(x, (x.size(-1),))
+def _functional_rms_norm(x, eps=1e-8):
+    return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-8):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        return _functional_rms_norm(x, self.eps) * self.weight
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -75,7 +84,7 @@ class BidirectionalAttention(nn.Module):
         # Apply Rotary Embeddings to queries and keys
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)  # QK norm
+        q, k = _functional_rms_norm(q), _functional_rms_norm(k)  # QK norm
         q, k, v = (
             q.transpose(1, 2),
             k.transpose(1, 2),
@@ -109,10 +118,12 @@ class Block(nn.Module):
         super().__init__()
         self.attn = BidirectionalAttention(config)
         self.mlp = MLP(config)
+        self.attn_norm = RMSNorm(config.n_embd)
+        self.mlp_norm = RMSNorm(config.n_embd)
 
     def forward(self, x, cos_sin):
-        x = x + self.attn(norm(x), cos_sin)
-        x = x + self.mlp(norm(x))
+        x = x + self.attn(self.attn_norm(x), cos_sin)
+        x = x + self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -130,6 +141,10 @@ class DiffusionTransformer(nn.Module):
 
         # Output head to predict denoised tokens
         self.output_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # Normalization layers
+        self.input_norm = RMSNorm(config.n_embd)
+        self.final_norm = RMSNorm(config.n_embd)
 
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 2
@@ -197,7 +212,7 @@ class DiffusionTransformer(nn.Module):
 
         # Add time embedding to all positions
         x = x + t_emb.unsqueeze(1)  # broadcast time embedding across sequence
-        x = norm(x)
+        x = self.input_norm(x)
 
         # Get rotary embeddings
         assert T <= self.cos.size(1)
@@ -206,7 +221,7 @@ class DiffusionTransformer(nn.Module):
         # Forward through transformer blocks
         for block in self.blocks:
             x = block(x, cos_sin)
-        x = norm(x)
+        x = self.final_norm(x)
 
         # Predict denoised tokens
         logits = self.output_head(x)  # (B, T, vocab_size)
