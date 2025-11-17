@@ -169,8 +169,15 @@ def train_step(model, x_0, mask_schedule, optimizer):
         logits.view(-1, logits.size(-1)), x_0.view(-1), reduction="none"
     )
     masked_loss = loss.view(B, -1) * mask.float()
-    denom = mask.sum().clamp_min(1)
-    loss = masked_loss.sum() / denom  # Average over masked positions only
+    tokens_per_sample = mask.view(B, -1).sum(dim=1).clamp_min(1)
+    per_example = masked_loss.sum(dim=1) / tokens_per_sample.float()
+
+    if mask_schedule.mask_probs.device != device:
+        mask_schedule.mask_probs = mask_schedule.mask_probs.to(device)
+    timestep_probs = mask_schedule.mask_probs[t].clamp(min=1e-3)
+    weights = (1.0 / timestep_probs).detach()
+    weights = weights / weights.mean()
+    loss = (per_example * weights).mean()
 
     # Backward pass
     optimizer.zero_grad()
