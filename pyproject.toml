@@ -9,4 +9,5 @@ dependencies = [
     "transformers>=4.44.0",
     "torch>=2.9.0",
     "tqdm>=4.67.1",
+    "wandb>=0.17.0",
 ]

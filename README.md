@@ -53,6 +53,8 @@ uv run animations/diffusion-process.py
 uv run animations/game-of-life.py
 ```
 
+### Track Training with Weights & Biases
+Enable experiment tracking by exporting `USE_WANDB=1` (and optionally `WANDB_PROJECT`/`WANDB_RUN_NAME`) before running `uv run training.py`. Router histograms, losses, learning rate, and periodic samples will be logged automatically.
 
 
 ## Default Config

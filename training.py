@@ -3,11 +3,23 @@ Training script for character-level discrete diffusion model
 """
 
 import math
+import os
 
 import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
+
+try:
+    import wandb
+except ImportError:  # pragma: no cover - fallback if dependency missing
+    wandb = None
+
+
+def _wandb_enabled():
+    flag = os.environ.get("USE_WANDB", "")
+    return flag.lower() in ("1", "true", "yes")
+
 from model import (
     DiffusionTransformer,
     DiffusionConfig,
@@ -160,6 +172,7 @@ def train_step(model, x_0, mask_schedule, optimizer, grad_clip=None):
     Returns:
         loss: Training loss
         router_stats: List of per-layer MoE histograms or None
+        aux_loss_value: Scalar MoE aux loss (float) or None
     """
     B, _ = x_0.shape
     device = x_0.device
@@ -200,13 +213,15 @@ def train_step(model, x_0, mask_schedule, optimizer, grad_clip=None):
         clip_grad_norm_(model.parameters(), grad_clip)
     optimizer.step()
 
-    return loss.item(), router_stats
+    aux_loss_value = aux_loss.item() if aux_loss is not None else None
+    return loss.item(), router_stats, aux_loss_value
 
 
-def log_router_histograms(router_stats, step=None):
+def log_router_histograms(router_stats, step=None, wandb_run=None):
     if router_stats is None:
         return
     lines = []
+    wandb_log = {}
     for layer_idx, hist in enumerate(router_stats):
         if hist is None:
             continue
@@ -220,10 +235,20 @@ def log_router_histograms(router_stats, step=None):
         count_str = ", ".join(str(c) for c in counts_list)
         frac_str = ", ".join(f"{f:.2f}" for f in frac_list)
         lines.append(f"  Layer {layer_idx:02d}: counts [{count_str}] | frac [{frac_str}]")
+        if wandb_run is not None:
+            for expert_idx, (count_val, frac_val) in enumerate(zip(counts_list, frac_list)):
+                wandb_log[
+                    f"router/layer_{layer_idx}/expert_{expert_idx}_count"
+                ] = count_val
+                wandb_log[
+                    f"router/layer_{layer_idx}/expert_{expert_idx}_frac"
+                ] = frac_val
     if not lines:
         return
     header = f"Router histogram @ step {step}" if step is not None else "Router histogram"
     tqdm.write("\n".join([header] + lines))
+    if wandb_run is not None and wandb_log:
+        wandb_run.log(wandb_log, step=step)
 
 
 def train(
@@ -239,6 +264,7 @@ def train(
     ema_decay=0.999,
     grad_clip=None,
     router_log_interval=500,
+    wandb_run=None,
 ):
     """
     Main training loop
@@ -251,7 +277,7 @@ def train(
         x_0 = next(data_loader)
 
         # Training step
-        loss, router_stats = train_step(
+        loss, router_stats, aux_loss_value = train_step(
             model, x_0, mask_schedule, optimizer, grad_clip=grad_clip
         )
 
@@ -263,13 +289,22 @@ def train(
         # Update progress bar
         pbar.set_postfix({"loss": f"{loss:.4f}"})
 
+        if wandb_run is not None:
+            log_payload = {
+                "train/loss": loss,
+                "train/lr": optimizer.param_groups[0]["lr"],
+            }
+            if aux_loss_value is not None:
+                log_payload["train/moe_aux_loss"] = aux_loss_value
+            wandb_run.log(log_payload, step=step + 1)
+
         if (
             router_stats is not None
             and router_log_interval is not None
             and router_log_interval > 0
             and (step + 1) % router_log_interval == 0
         ):
-            log_router_histograms(router_stats, step + 1)
+            log_router_histograms(router_stats, step + 1, wandb_run=wandb_run)
 
         # Sample generation
         if (step + 1) % sample_interval == 0:
@@ -299,6 +334,11 @@ def train(
                 tqdm.write(f"\n--- Sample at step {step + 1} ---")
                 tqdm.write(text)
                 tqdm.write("--- End sample ---\n")
+                if wandb_run is not None:
+                    formatted = text.replace("\n", "<br>")
+                    wandb_run.log(
+                        {"samples/text": wandb.Html(formatted)}, step=step + 1
+                    )
             if ema_model is None and was_training:
                 eval_model.train()
 
@@ -382,22 +422,61 @@ def main():
             text = f.read()
         dataset_tokens = encode_text(text, tokenizer)
 
-    # Train
-    print("Starting training...\n")
-    train(
-        model=model,
-        data_loader=data_loader,
-        mask_schedule=mask_schedule,
-        optimizer=optimizer,
-        num_steps=max_iters,
-        sample_interval=eval_interval,
-        dataset_tokens=dataset_tokens,
-        scheduler=scheduler,
-        ema_model=ema_model,
-        ema_decay=ema_decay,
-        grad_clip=grad_clip,
-        router_log_interval=eval_interval,
-    )
+    wandb_run = None
+    if _wandb_enabled():
+        if wandb is None:
+            raise ImportError(
+                "wandb is not installed but USE_WANDB is enabled. "
+                "Install wandb or unset USE_WANDB."
+            )
+        wandb_config = {
+            "batch_size": batch_size,
+            "learning_rate": learning_rate,
+            "max_iters": max_iters,
+            "warmup_iters": warmup_iters,
+            "ema_decay": ema_decay,
+            "grad_clip": grad_clip,
+            "sequence_len": config.sequence_len,
+            "diffusion_steps": config.diffusion_steps,
+            "context_len": config.context_len,
+            "n_layer": config.n_layer,
+            "n_head": config.n_head,
+            "n_embd": config.n_embd,
+            "num_experts": config.num_experts,
+            "moe_top_k": config.moe_top_k,
+            "moe_capacity_factor": config.moe_capacity_factor,
+            "moe_router_jitter": config.moe_router_jitter,
+            "moe_aux_loss_weight": config.moe_aux_loss_weight,
+            "device": str(device),
+        }
+        wandb_project = os.environ.get("WANDB_PROJECT", "tiny-diffusion")
+        wandb_run = wandb.init(
+            project=wandb_project,
+            name=os.environ.get("WANDB_RUN_NAME"),
+            config=wandb_config,
+        )
+
+    try:
+        # Train
+        print("Starting training...\n")
+        train(
+            model=model,
+            data_loader=data_loader,
+            mask_schedule=mask_schedule,
+            optimizer=optimizer,
+            num_steps=max_iters,
+            sample_interval=eval_interval,
+            dataset_tokens=dataset_tokens,
+            scheduler=scheduler,
+            ema_model=ema_model,
+            ema_decay=ema_decay,
+            grad_clip=grad_clip,
+            router_log_interval=eval_interval,
+            wandb_run=wandb_run,
+        )
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
 
     # Save model
     import os
