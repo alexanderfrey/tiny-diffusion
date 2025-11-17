@@ -249,11 +249,7 @@ class DiffusionTransformer(nn.Module):
         """
         if device is None:
             device = self.get_device()
-        max_steps = self.config.diffusion_steps
-        if num_steps is None:
-            num_steps = max_steps
-        else:
-            num_steps = min(num_steps, max_steps)
+        timesteps = self._get_sampling_schedule(num_steps, device)
 
         # Start from all mask tokens
         x = torch.full(
@@ -276,14 +272,16 @@ class DiffusionTransformer(nn.Module):
             masked_positions[:, :context_len] = False
 
         # Decode step by step
-        for step in range(num_steps):
+        for step in timesteps:
             # Check if all tokens are decoded
             if not masked_positions.any():
                 break
 
-            # Create timestep (use step as proxy for timestep)
-            t_batch = torch.full((batch_size,), step, device=device, dtype=torch.long)
-            t_batch = torch.clamp(t_batch, 0, self.config.diffusion_steps - 1)
+            # Create timestep (use actual diffusion timestep)
+            t_val = step.long()
+            t_batch = torch.full(
+                (batch_size,), t_val.item(), device=device, dtype=torch.long
+            )
 
             # Predict tokens
             logits = self.forward(x, t_batch)
@@ -336,11 +334,7 @@ class DiffusionTransformer(nn.Module):
         """
         if device is None:
             device = self.get_device()
-        max_steps = self.config.diffusion_steps
-        if num_steps is None:
-            num_steps = max_steps
-        else:
-            num_steps = min(num_steps, max_steps)
+        timesteps = self._get_sampling_schedule(num_steps, device)
 
         # Start from all mask tokens
         x = torch.full(
@@ -363,14 +357,16 @@ class DiffusionTransformer(nn.Module):
             masked_positions[:, :context_len] = False
 
         # Decode step by step
-        for step in range(num_steps):
+        for step in timesteps:
             # Check if all tokens are decoded
             if not masked_positions.any():
                 break
 
-            # Create timestep (use step as proxy for timestep)
-            t_batch = torch.full((batch_size,), step, device=device, dtype=torch.long)
-            t_batch = torch.clamp(t_batch, 0, self.config.diffusion_steps - 1)
+            # Create timestep (use actual diffusion timestep)
+            t_val = step.long()
+            t_batch = torch.full(
+                (batch_size,), t_val.item(), device=device, dtype=torch.long
+            )
 
             # Predict tokens
             logits = self.forward(x, t_batch)
@@ -444,6 +440,26 @@ class DiffusionTransformer(nn.Module):
             )
         else:
             raise ValueError(f"Unknown sampling method: {method}")
+
+    def _get_sampling_schedule(self, num_steps, device):
+        """
+        Create a schedule of diffusion timesteps to visit during sampling.
+        We always start from the noisiest step and move toward 0 so the model
+        sees the same conditioning distribution as in training.
+        """
+        max_steps = self.config.diffusion_steps
+        if num_steps is None or num_steps >= max_steps:
+            timesteps = torch.arange(
+                max_steps - 1, -1, -1, device=device, dtype=torch.long
+            )
+        else:
+            # Downsample the schedule if the user wants fewer steps
+            lin = torch.linspace(
+                max_steps - 1, 0, steps=num_steps, device=device, dtype=torch.float32
+            )
+            timesteps = lin.round().clamp_(0, max_steps - 1).long()
+            timesteps = torch.unique_consecutive(timesteps, dim=0)
+        return timesteps
 
 
 def encode_text(text):
