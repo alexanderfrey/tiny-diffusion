@@ -14,7 +14,7 @@ from model import (
     decode_tokens,
 )
 from sample import get_random_context
-from tokenizer import get_tokenizer
+from tokenizer import get_tokenizer, tokenizer_vocab_size
 
 
 class MaskedDiffusionSchedule:
@@ -242,13 +242,10 @@ def main():
     learning_rate = 3e-4
 
     data_path = "data/tiny_shakespeare.txt"
-    tokenizer = get_tokenizer(
-        tokenizer_path="data/bpe_tokenizer.json",
-        data_path=data_path,
-        vocab_size=1024,
-    )
+    tokenizer = get_tokenizer()
+    vocab_size = tokenizer_vocab_size(tokenizer)
     config = DiffusionConfig(
-        vocab_size=tokenizer.vocab_size, mask_token_id=tokenizer.mask_token_id
+        vocab_size=vocab_size, mask_token_id=tokenizer.mask_token_id
     )
     print(f"Sequence_len: {config.sequence_len}")
     print(f"Diffusion_steps: {config.diffusion_steps}")

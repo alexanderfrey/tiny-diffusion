@@ -9,7 +9,7 @@ from model import (
     decode_tokens,
     encode_text,
 )
-from tokenizer import get_tokenizer
+from tokenizer import get_tokenizer, tokenizer_vocab_size
 
 
 def load_dataset_text(data_path="data/tiny_shakespeare.txt", tokenizer=None):
@@ -32,8 +32,9 @@ def get_random_context(dataset_tokens, context_len, batch_size=1):
 def load_model(checkpoint_path, device, tokenizer):
     """Load a trained model from checkpoint"""
     # Create model with same config as training
+    vocab_size = tokenizer_vocab_size(tokenizer)
     config = DiffusionConfig(
-        vocab_size=tokenizer.vocab_size, mask_token_id=tokenizer.mask_token_id
+        vocab_size=vocab_size, mask_token_id=tokenizer.mask_token_id
     )
 
     model = DiffusionTransformer(config).to(device)

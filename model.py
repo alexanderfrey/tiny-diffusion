@@ -464,16 +464,17 @@ class DiffusionTransformer(nn.Module):
 
 
 def encode_text(text, tokenizer=None):
-    """Convert text to vocab indices using the shared BPE tokenizer."""
+    """Convert text to vocab indices using the shared GPT-2 tokenizer."""
     tok = tokenizer or get_tokenizer()
-    return tok.encode(text)
+    token_ids = tok.encode(text, add_special_tokens=False)
+    return torch.tensor(token_ids, dtype=torch.long)
 
 
 def decode_tokens(tokens, tokenizer=None):
-    """Convert vocab indices back to text using the shared BPE tokenizer."""
+    """Convert vocab indices back to text using the shared GPT-2 tokenizer."""
     tok = tokenizer or get_tokenizer()
     if isinstance(tokens, torch.Tensor):
         token_seq = tokens.tolist()
     else:
         token_seq = list(tokens)
-    return tok.decode(token_seq)
+    return tok.decode(token_seq, skip_special_tokens=True)
