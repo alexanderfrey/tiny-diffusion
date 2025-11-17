@@ -2,6 +2,8 @@
 Training script for character-level discrete diffusion model
 """
 
+import math
+
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -25,14 +27,30 @@ class MaskedDiffusionSchedule:
         self.mask_token_id = mask_token_id
         self.context_len = context_len
 
-        # Linear schedule: probability of masking increases linearly
-        self.mask_probs = torch.linspace(
-            1.0 / num_timesteps, 1.0, num_timesteps, dtype=torch.float32
-        )
+        # Use a cosine schedule so mid-range steps get more weight than the ends
+        steps = torch.arange(1, num_timesteps + 1, dtype=torch.float32)
+        normalized = steps / num_timesteps
+        mask_probs = torch.sin(normalized * math.pi / 2).pow(2)
+        self.mask_probs = mask_probs.clamp(min=1.0 / (2 * num_timesteps), max=1.0)
+
+        # Precompute timestep sampling weights (Beta(2,2)-like) to emphasize mid-range
+        centers = (torch.arange(num_timesteps, dtype=torch.float32) + 0.5) / num_timesteps
+        weights = torch.sin(math.pi * centers).pow(2)
+        weights = weights + 1e-3  # avoid zero probability at the boundaries
+        self.sample_weights = weights / weights.sum()
 
     def to(self, device):
         self.mask_probs = self.mask_probs.to(device)
+        self.sample_weights = self.sample_weights.to(device)
         return self
+
+    def sample_timesteps(self, batch_size, device):
+        """Draw diffusion steps with preference for the informative mid-range."""
+        if self.sample_weights.device != device:
+            self.sample_weights = self.sample_weights.to(device)
+        return torch.multinomial(
+            self.sample_weights, num_samples=batch_size, replacement=True
+        )
 
     def add_masks(self, x_0, t):
         """
@@ -135,8 +153,8 @@ def train_step(model, x_0, mask_schedule, optimizer):
     B, _ = x_0.shape
     device = x_0.device
 
-    # Sample random timesteps
-    t = torch.randint(0, mask_schedule.num_timesteps, (B,), device=device)
+    # Sample timesteps with mid-range emphasis
+    t = mask_schedule.sample_timesteps(B, device=device)
 
     # Add mask to get x_t
     x_t = mask_schedule.add_masks(x_0, t)
