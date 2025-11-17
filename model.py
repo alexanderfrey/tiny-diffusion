@@ -153,6 +153,8 @@ class DiffusionTransformer(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
+        mask_schedule = self._build_mask_schedule(config.diffusion_steps)
+        self.register_buffer("mask_schedule", mask_schedule, persistent=False)
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -186,6 +188,14 @@ class DiffusionTransformer(nn.Module):
             sin[None, :, None, :],
         )  # add batch and head dims
         return cos, sin
+
+    def _build_mask_schedule(self, num_timesteps):
+        steps = torch.arange(1, num_timesteps + 1, dtype=torch.float32)
+        normalized = steps / num_timesteps
+        mask_probs = torch.sin(normalized * math.pi / 2).pow(2)
+        mask_probs = mask_probs.clamp(min=1.0 / (2 * num_timesteps), max=1.0)
+        mask_probs[0] = 0.0  # ensure final step fully decodes
+        return mask_probs
 
     def get_device(self):
         return self.token_emb.weight.device
@@ -227,15 +237,16 @@ class DiffusionTransformer(nn.Module):
         self,
         batch_size,
         seq_len,
-        k,
+        k=None,
         num_steps=None,
         temperature=1.0,
         device=None,
         context_tokens=None,
     ):
         """
-        Generate samples using top-K parallel decoding (LLaDA baseline).
-        At each step, decode exactly K tokens with highest confidence.
+        Generate samples using top-K-style parallel decoding.
+        At each diffusion timestep, release as many tokens as required by the
+        training mask schedule, optionally capping updates with `k`.
 
         Args:
             batch_size: Number of samples to generate
@@ -251,26 +262,9 @@ class DiffusionTransformer(nn.Module):
         if device is None:
             device = self.get_device()
         timesteps = self._get_sampling_schedule(num_steps, device)
-
-        # Start from all mask tokens
-        x = torch.full(
-            (batch_size, seq_len),
-            self.config.mask_token_id,
-            dtype=torch.long,
-            device=device,
+        x, masked_positions, initial_masked = self._init_sampling_state(
+            batch_size, seq_len, device, context_tokens
         )
-
-        # If context tokens provided, set them in the first context_len positions
-        if context_tokens is not None:
-            context_len = context_tokens.size(1)
-            x[:, :context_len] = context_tokens.to(device)
-
-        # Track which positions are still masked
-        masked_positions = torch.ones(
-            batch_size, seq_len, dtype=torch.bool, device=device
-        )
-        if context_tokens is not None:
-            masked_positions[:, :context_len] = False
 
         # Decode step by step
         for step in timesteps:
@@ -291,19 +285,26 @@ class DiffusionTransformer(nn.Module):
             probs = F.softmax(logits / temperature, dim=-1)
             confidences, predicted_tokens = torch.max(probs, dim=-1)  # (B, T)
 
-            # Mask out already-decoded positions
-            confidences = confidences.masked_fill(~masked_positions, -float("inf"))
+            decode_counts = self._decode_counts_from_schedule(
+                masked_positions, initial_masked, t_val, cap=k
+            )
 
-            # Select top-K positions per batch
-            k_actual = min(k, masked_positions.sum(dim=1).max().item())
-            _, topk_indices = torch.topk(confidences, k=k_actual, dim=1)  # (B, K)
+            masked_confidences = confidences.masked_fill(
+                ~masked_positions, -float("inf")
+            )
 
-            # Update the top-K positions
+            # Update the scheduled number of positions
             for b in range(batch_size):
-                for idx in topk_indices[b]:
-                    if masked_positions[b, idx]:
-                        x[b, idx] = predicted_tokens[b, idx]
-                        masked_positions[b, idx] = False
+                need = int(decode_counts[b].item())
+                if need <= 0:
+                    continue
+                available = int(masked_positions[b].sum().item())
+                if available == 0:
+                    continue
+                need = min(need, available)
+                _, topk_idx = torch.topk(masked_confidences[b], k=need)
+                x[b, topk_idx] = predicted_tokens[b, topk_idx]
+                masked_positions[b, topk_idx] = False
 
         return x
 
@@ -320,7 +321,8 @@ class DiffusionTransformer(nn.Module):
     ):
         """
         Generate samples using confidence-aware parallel decoding (Fast-dLLM).
-        At each step, decode all tokens whose confidence exceeds a threshold.
+        Each timestep decodes the number of tokens prescribed by the mask
+        schedule while prioritizing logits above the provided threshold.
 
         Args:
             batch_size: Number of samples to generate
@@ -336,26 +338,9 @@ class DiffusionTransformer(nn.Module):
         if device is None:
             device = self.get_device()
         timesteps = self._get_sampling_schedule(num_steps, device)
-
-        # Start from all mask tokens
-        x = torch.full(
-            (batch_size, seq_len),
-            self.config.mask_token_id,
-            dtype=torch.long,
-            device=device,
+        x, masked_positions, initial_masked = self._init_sampling_state(
+            batch_size, seq_len, device, context_tokens
         )
-
-        # If context tokens provided, set them in the first context_len positions
-        if context_tokens is not None:
-            context_len = context_tokens.size(1)
-            x[:, :context_len] = context_tokens.to(device)
-
-        # Track which positions are still masked
-        masked_positions = torch.ones(
-            batch_size, seq_len, dtype=torch.bool, device=device
-        )
-        if context_tokens is not None:
-            masked_positions[:, :context_len] = False
 
         # Decode step by step
         for step in timesteps:
@@ -376,21 +361,40 @@ class DiffusionTransformer(nn.Module):
             probs = F.softmax(logits / temperature, dim=-1)
             confidences, predicted_tokens = torch.max(probs, dim=-1)  # (B, T)
 
+            decode_counts = self._decode_counts_from_schedule(
+                masked_positions, initial_masked, t_val
+            )
+
             # Select positions above threshold (only among masked positions)
-            above_threshold = (confidences >= confidence_threshold) & masked_positions
+            candidates = (confidences >= confidence_threshold) & masked_positions
+            selected = candidates.clone()
+            selected_counts = selected.sum(dim=1)
+            remaining = (decode_counts - selected_counts).clamp(min=0)
 
-            # Ensure at least one token is decoded per batch if any remain masked
-            for b in range(batch_size):
-                if masked_positions[b].any() and not above_threshold[b].any():
-                    # Decode the highest confidence masked token
-                    masked_confidences = confidences[b].clone()
-                    masked_confidences[~masked_positions[b]] = -float("inf")
-                    best_idx = torch.argmax(masked_confidences)
-                    above_threshold[b, best_idx] = True
+            if remaining.any():
+                masked_confidences = confidences.masked_fill(
+                    ~masked_positions, -float("inf")
+                )
+                for b in range(batch_size):
+                    need = int(remaining[b].item())
+                    if need <= 0:
+                        continue
+                    available = int(masked_positions[b].sum().item())
+                    if available == 0:
+                        continue
+                    # Exclude already-selected positions
+                    mask = masked_positions[b] & ~selected[b]
+                    if mask.sum() == 0:
+                        continue
+                    need = min(need, int(mask.sum().item()))
+                    masked_view = masked_confidences[b].clone()
+                    masked_view[~mask] = -float("inf")
+                    _, extra_idx = torch.topk(masked_view, k=need)
+                    selected[b, extra_idx] = True
 
-            # Update positions above threshold
-            x = torch.where(above_threshold, predicted_tokens, x)
-            masked_positions = masked_positions & ~above_threshold
+            # Update positions according to combined selection
+            x = torch.where(selected, predicted_tokens, x)
+            masked_positions = masked_positions & ~selected
 
         return x
 
@@ -418,16 +422,20 @@ class DiffusionTransformer(nn.Module):
             device: Device to generate on
             context_tokens: Optional context tokens for conditioning, shape (batch_size, context_len)
             method: Decoding method - 'topk' or 'confidence'
-            k: Number of tokens per step (for 'topk' method)
+            k: Optional cap on tokens revealed per step (for 'topk' method)
             confidence_threshold: Confidence threshold τ (for 'confidence' method)
         Returns:
             samples: Generated token sequences, shape (batch_size, seq_len)
         """
         if method == "topk":
-            if k is None:
-                k = max(1, seq_len // 10)  # Default: decode 10% per step
             return self.sample_topk(
-                batch_size, seq_len, k, num_steps, temperature, device, context_tokens
+                batch_size,
+                seq_len,
+                k,
+                num_steps,
+                temperature,
+                device,
+                context_tokens,
             )
         elif method == "confidence":
             return self.sample_confidence(
@@ -461,6 +469,44 @@ class DiffusionTransformer(nn.Module):
             timesteps = lin.round().clamp_(0, max_steps - 1).long()
             timesteps = torch.unique_consecutive(timesteps, dim=0)
         return timesteps
+
+    def _init_sampling_state(self, batch_size, seq_len, device, context_tokens):
+        x = torch.full(
+            (batch_size, seq_len),
+            self.config.mask_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        masked_positions = torch.ones(
+            batch_size, seq_len, dtype=torch.bool, device=device
+        )
+        context_len = 0
+        if context_tokens is not None:
+            context_len = min(context_tokens.size(1), seq_len)
+            x[:, :context_len] = context_tokens[:, :context_len].to(device)
+            masked_positions[:, :context_len] = False
+        initial_masked = masked_positions.sum(dim=1)
+        return x, masked_positions, initial_masked
+
+    def _decode_counts_from_schedule(
+        self, masked_positions, initial_masked_counts, timestep, cap=None
+    ):
+        if masked_positions.numel() == 0:
+            return torch.zeros(0, dtype=torch.long, device=initial_masked_counts.device)
+        mask_ratio = self.mask_schedule[timestep]
+        desired = (mask_ratio * initial_masked_counts.float()).round().long()
+        desired = torch.minimum(desired, initial_masked_counts)
+        current = masked_positions.sum(dim=1)
+        decode_needed = (current - desired).clamp(min=0)
+        decode_needed = torch.minimum(decode_needed, current)
+        needs_progress = (current > 0) & (decode_needed == 0)
+        decode_needed = torch.where(
+            needs_progress, torch.ones_like(decode_needed), decode_needed
+        )
+        if cap is not None:
+            cap_tensor = torch.full_like(decode_needed, cap)
+            decode_needed = torch.minimum(decode_needed, cap_tensor)
+        return decode_needed
 
 
 def encode_text(text, tokenizer=None):
