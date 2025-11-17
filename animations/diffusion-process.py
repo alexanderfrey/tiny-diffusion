@@ -35,11 +35,18 @@ def load_model(checkpoint_path, device, tokenizer):
 
 
 def load_initial_context(data_path, context_len, tokenizer):
-    """Load the first context_len characters from dataset"""
+    """Load exactly context_len tokens from dataset for the initial prompt"""
+    if context_len <= 0:
+        return torch.empty(0, dtype=torch.long)
     with open(data_path, "r", encoding="utf-8") as f:
-        text = f.read()[:context_len]
+        text = f.read()
     tokens = encode_text(text, tokenizer)
-    return tokens
+    if tokens.numel() < context_len:
+        raise ValueError(
+            f"Dataset only provided {tokens.numel()} tokens, "
+            f"but context_len={context_len} requires more."
+        )
+    return tokens[:context_len]
 
 
 def generate_with_visualization(
