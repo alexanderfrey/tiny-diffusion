@@ -155,12 +155,6 @@ class DiffusionTransformer(nn.Module):
 
     def init_weights(self):
         self.apply(self._init_weights)
-        # Zero out output head weights
-        torch.nn.init.zeros_(self.output_head.weight)
-        # Zero out c_proj weights in all blocks
-        for block in self.blocks:
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
         # Init the rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
