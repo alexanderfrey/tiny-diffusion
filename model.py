@@ -281,9 +281,13 @@ class DiffusionTransformer(nn.Module):
             # Predict tokens
             logits = self.forward(x, t_batch)
 
-            # Get confidence scores (max probability for each position)
-            probs = F.softmax(logits / temperature, dim=-1)
-            confidences, predicted_tokens = torch.max(probs, dim=-1)  # (B, T)
+            # Sample tokens stochastically while measuring peak confidence
+            temp = max(temperature, 1e-4)
+            probs = F.softmax(logits / temp, dim=-1)
+            confidences, _ = torch.max(probs, dim=-1)  # (B, T)
+            predicted_tokens = torch.multinomial(
+                probs.reshape(-1, probs.size(-1)), num_samples=1
+            ).view(batch_size, seq_len)
 
             decode_counts = self._decode_counts_from_schedule(
                 masked_positions, initial_masked, t_val, cap=k
@@ -357,9 +361,13 @@ class DiffusionTransformer(nn.Module):
             # Predict tokens
             logits = self.forward(x, t_batch)
 
-            # Get confidence scores (max probability for each position)
-            probs = F.softmax(logits / temperature, dim=-1)
-            confidences, predicted_tokens = torch.max(probs, dim=-1)  # (B, T)
+            # Sample tokens stochastically while measuring peak confidence
+            temp = max(temperature, 1e-4)
+            probs = F.softmax(logits / temp, dim=-1)
+            confidences, _ = torch.max(probs, dim=-1)  # (B, T)
+            predicted_tokens = torch.multinomial(
+                probs.reshape(-1, probs.size(-1)), num_samples=1
+            ).view(batch_size, seq_len)
 
             decode_counts = self._decode_counts_from_schedule(
                 masked_positions, initial_masked, t_val
