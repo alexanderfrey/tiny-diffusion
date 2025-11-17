@@ -14,6 +14,7 @@ from model import (
     decode_tokens,
 )
 from sample import get_random_context
+from tokenizer import get_tokenizer
 
 
 class MaskedDiffusionSchedule:
@@ -104,7 +105,7 @@ class MaskedDiffusionSchedule:
         return self.mask_probs[t].item()
 
 
-def get_data_loader(data_path, batch_size, seq_len, device):
+def get_data_loader(data_path, batch_size, seq_len, device, tokenizer):
     """
     Simple data loader for text data
     Args:
@@ -118,7 +119,7 @@ def get_data_loader(data_path, batch_size, seq_len, device):
         text = f.read()
 
     # Convert to tokens
-    tokens = encode_text(text)
+    tokens = encode_text(text, tokenizer)
 
     # Determine max starting index for sampling
     max_start = len(tokens) - seq_len
@@ -240,7 +241,15 @@ def main():
     eval_interval = 500
     learning_rate = 3e-4
 
-    config = DiffusionConfig()  # default config
+    data_path = "data/tiny_shakespeare.txt"
+    tokenizer = get_tokenizer(
+        tokenizer_path="data/bpe_tokenizer.json",
+        data_path=data_path,
+        vocab_size=1024,
+    )
+    config = DiffusionConfig(
+        vocab_size=tokenizer.vocab_size, mask_token_id=tokenizer.mask_token_id
+    )
     print(f"Sequence_len: {config.sequence_len}")
     print(f"Diffusion_steps: {config.diffusion_steps}")
     print(f"Context_len: {config.context_len}")
@@ -274,12 +283,12 @@ def main():
     )
 
     # Data loader
-    data_path = "data/tiny_shakespeare.txt"
     data_loader = get_data_loader(
         data_path=data_path,
         batch_size=batch_size,
         seq_len=config.sequence_len,
         device=device,
+        tokenizer=tokenizer,
     )
 
     # Load dataset tokens for context sampling
@@ -287,7 +296,7 @@ def main():
     if config.context_len > 0:
         with open(data_path, "r", encoding="utf-8") as f:
             text = f.read()
-        dataset_tokens = encode_text(text)
+        dataset_tokens = encode_text(text, tokenizer)
 
     # Train
     print("Starting training...\n")

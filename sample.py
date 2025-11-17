@@ -9,13 +9,14 @@ from model import (
     decode_tokens,
     encode_text,
 )
+from tokenizer import get_tokenizer
 
 
-def load_dataset_text(data_path="data/tiny_shakespeare.txt"):
+def load_dataset_text(data_path="data/tiny_shakespeare.txt", tokenizer=None):
     """Load dataset text for random context sampling"""
     with open(data_path, "r", encoding="utf-8") as f:
         text = f.read()
-    return encode_text(text)
+    return encode_text(text, tokenizer)
 
 
 def get_random_context(dataset_tokens, context_len, batch_size=1):
@@ -28,10 +29,12 @@ def get_random_context(dataset_tokens, context_len, batch_size=1):
     return context_tokens
 
 
-def load_model(checkpoint_path, device):
+def load_model(checkpoint_path, device, tokenizer):
     """Load a trained model from checkpoint"""
     # Create model with same config as training
-    config = DiffusionConfig()
+    config = DiffusionConfig(
+        vocab_size=tokenizer.vocab_size, mask_token_id=tokenizer.mask_token_id
+    )
 
     model = DiffusionTransformer(config).to(device)
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
@@ -188,17 +191,21 @@ def main():
         device = torch.device("cpu")
     print(f"Using device: {device}\n")
 
+    tokenizer = get_tokenizer()
+
     # Load model
     checkpoint_path = "weights/diffusion_model.pt"
     print(f"Loading model from {checkpoint_path}...")
-    model = load_model(checkpoint_path, device)
+    model = load_model(checkpoint_path, device, tokenizer)
     print("Model loaded!\n")
 
     # Load dataset for random context sampling
     dataset_tokens = None
     if model.config.context_len > 0:
         print("Loading dataset for context sampling...")
-        dataset_tokens = load_dataset_text("data/tiny_shakespeare.txt")
+        dataset_tokens = load_dataset_text(
+            "data/tiny_shakespeare.txt", tokenizer=tokenizer
+        )
         print(f"Loaded {len(dataset_tokens)} tokens from dataset\n")
 
     # Sampling configuration

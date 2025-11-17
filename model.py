@@ -22,6 +22,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tokenizer import get_tokenizer
 
 
 @dataclass
@@ -462,13 +463,17 @@ class DiffusionTransformer(nn.Module):
         return timesteps
 
 
-def encode_text(text):
-    """Convert text to vocab indices using direct ASCII mapping"""
-    tokens = torch.tensor([min(ord(c), 127) for c in text], dtype=torch.long)
-    return tokens
+def encode_text(text, tokenizer=None):
+    """Convert text to vocab indices using the shared BPE tokenizer."""
+    tok = tokenizer or get_tokenizer()
+    return tok.encode(text)
 
 
-def decode_tokens(tokens):
-    """Convert vocab indices to text using direct ASCII mapping"""
-    text = "".join([chr(int(t)) for t in tokens])
-    return text
+def decode_tokens(tokens, tokenizer=None):
+    """Convert vocab indices back to text using the shared BPE tokenizer."""
+    tok = tokenizer or get_tokenizer()
+    if isinstance(tokens, torch.Tensor):
+        token_seq = tokens.tolist()
+    else:
+        token_seq = list(tokens)
+    return tok.decode(token_seq)
