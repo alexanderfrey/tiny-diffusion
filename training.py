@@ -6,6 +6,7 @@ import math
 
 import torch
 import torch.nn.functional as F
+from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
 from model import (
     DiffusionTransformer,
@@ -105,6 +106,13 @@ class MaskedDiffusionSchedule:
         return self.mask_probs[t].item()
 
 
+@torch.no_grad()
+def update_ema(model, ema_model, decay):
+    """Exponential moving average of model parameters."""
+    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+        ema_param.data.mul_(decay).add_(param.data, alpha=1.0 - decay)
+
+
 def get_data_loader(data_path, batch_size, seq_len, device, tokenizer):
     """
     Simple data loader for text data
@@ -140,7 +148,7 @@ def get_data_loader(data_path, batch_size, seq_len, device, tokenizer):
     return data_generator()
 
 
-def train_step(model, x_0, mask_schedule, optimizer):
+def train_step(model, x_0, mask_schedule, optimizer, grad_clip=None):
     """
     Single training step
     Args:
@@ -148,6 +156,7 @@ def train_step(model, x_0, mask_schedule, optimizer):
         x_0: Clean tokens, shape (B, T)
         mask_schedule: Mask schedule object
         optimizer: Optimizer
+        grad_clip: Optional gradient clipping value
     Returns:
         loss: Training loss
     """
@@ -182,6 +191,8 @@ def train_step(model, x_0, mask_schedule, optimizer):
     # Backward pass
     optimizer.zero_grad()
     loss.backward()
+    if grad_clip is not None:
+        clip_grad_norm_(model.parameters(), grad_clip)
     optimizer.step()
 
     return loss.item()
@@ -195,6 +206,10 @@ def train(
     num_steps=10000,
     sample_interval=500,
     dataset_tokens=None,
+    scheduler=None,
+    ema_model=None,
+    ema_decay=0.999,
+    grad_clip=None,
 ):
     """
     Main training loop
@@ -207,28 +222,35 @@ def train(
         x_0 = next(data_loader)
 
         # Training step
-        loss = train_step(model, x_0, mask_schedule, optimizer)
+        loss = train_step(model, x_0, mask_schedule, optimizer, grad_clip=grad_clip)
+
+        if scheduler is not None:
+            scheduler.step()
+        if ema_model is not None:
+            update_ema(model, ema_model, ema_decay)
 
         # Update progress bar
         pbar.set_postfix({"loss": f"{loss:.4f}"})
 
         # Sample generation
         if (step + 1) % sample_interval == 0:
-            model.eval()
+            eval_model = ema_model if ema_model is not None else model
+            was_training = eval_model.training
+            eval_model.eval()
             with torch.no_grad():
                 # Get random context if context_len > 0
                 context_tokens = None
-                if model.config.context_len > 0 and dataset_tokens is not None:
+                if eval_model.config.context_len > 0 and dataset_tokens is not None:
                     context_tokens = get_random_context(
-                        dataset_tokens, model.config.context_len, batch_size=1
+                        dataset_tokens, eval_model.config.context_len, batch_size=1
                     )
 
-                samples = model.sample(
+                samples = eval_model.sample(
                     batch_size=1,
-                    seq_len=model.config.sequence_len,
+                    seq_len=eval_model.config.sequence_len,
                     num_steps=None,
                     temperature=1.0,
-                    device=model.get_device(),
+                    device=eval_model.get_device(),
                     context_tokens=context_tokens,
                     method="confidence",
                     confidence_threshold=0.95,
@@ -238,7 +260,8 @@ def train(
                 tqdm.write(f"\n--- Sample at step {step + 1} ---")
                 tqdm.write(text)
                 tqdm.write("--- End sample ---\n")
-            model.train()
+            if ema_model is None and was_training:
+                eval_model.train()
 
 
 def main():
@@ -247,6 +270,9 @@ def main():
     max_iters = 20000
     eval_interval = 500
     learning_rate = 3e-4
+    warmup_iters = max(1000, max_iters // 10)
+    ema_decay = 0.999
+    grad_clip = 1.0
 
     data_path = "data/tiny_shakespeare.txt"
     tokenizer = get_tokenizer()
@@ -270,6 +296,11 @@ def main():
     # Model
     model = DiffusionTransformer(config).to(device)
     model.init_weights()
+    ema_model = DiffusionTransformer(config).to(device)
+    ema_model.load_state_dict(model.state_dict())
+    ema_model.eval()
+    for param in ema_model.parameters():
+        param.requires_grad_(False)
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Number of parameters: {num_params:,}")
@@ -285,6 +316,16 @@ def main():
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=0.01
     )
+
+    def lr_lambda(step):
+        if step < warmup_iters:
+            return float(step + 1) / max(1, warmup_iters)
+        progress = min(
+            float(step - warmup_iters) / max(1, max_iters - warmup_iters), 1.0
+        )
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # Data loader
     data_loader = get_data_loader(
@@ -312,14 +353,19 @@ def main():
         num_steps=max_iters,
         sample_interval=eval_interval,
         dataset_tokens=dataset_tokens,
+        scheduler=scheduler,
+        ema_model=ema_model,
+        ema_decay=ema_decay,
+        grad_clip=grad_clip,
     )
 
     # Save model
     import os
 
     os.makedirs("weights", exist_ok=True)
-    torch.save(model.state_dict(), "weights/diffusion_model.pt")
-    print("Model saved to weights/diffusion_model.pt")
+    target_model = ema_model if ema_model is not None else model
+    torch.save(target_model.state_dict(), "weights/diffusion_model.pt")
+    print("EMA model saved to weights/diffusion_model.pt")
 
 
 if __name__ == "__main__":
