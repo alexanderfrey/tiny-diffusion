@@ -64,6 +64,33 @@ uv run animations/game-of-life.py
 - **Sequence Length**: 256 characters
 - **Diffusion Steps**: 128
 
+## MoE Architecture Overview
+
+The optional Mixture-of-Experts path replaces the dense feed-forward with routers that dispatch tokens to a small pool of experts. With 16 layers and 3 experts, each block looks like the diagram below:
+
+```
+            Input Tokens
+                  |
+      +-------------------------+
+      | Token + Time Embedding  |
+      +-------------------------+
+                  |
+  +-----------------------------------------------------+
+  |        16 x Diffusion Transformer Blocks            |
+  |                                                     |
+  |  +--------------+    +----------------------------+ |
+  |  | Attention +  |--->| Router (top-k)             | |
+  |  | RMSNorm      |    | + 3 parallel experts (E0..)| |
+  |  +--------------+    +------------+---------------+ |
+  |                               | | |                |
+  |             Weighted sum / residual merge          |
+  +-----------------------------------------------------+
+                  |
+          Output logits
+```
+
+Routers emit gate histograms during training, making it easy to track how balanced the three experts are layer-by-layer.
+
 
 
 ## File Structure

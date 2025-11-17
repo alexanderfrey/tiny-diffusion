@@ -159,6 +159,7 @@ def train_step(model, x_0, mask_schedule, optimizer, grad_clip=None):
         grad_clip: Optional gradient clipping value
     Returns:
         loss: Training loss
+        router_stats: List of per-layer MoE histograms or None
     """
     B, _ = x_0.shape
     device = x_0.device
@@ -170,7 +171,9 @@ def train_step(model, x_0, mask_schedule, optimizer, grad_clip=None):
     x_t = mask_schedule.add_masks(x_0, t)
 
     # Forward pass: predict the original tokens
-    logits = model(x_t, t)  # (B, T, vocab_size)
+    logits, aux_loss, router_stats = model(
+        x_t, t, return_aux=True, return_router_stats=True
+    )  # (B, T, vocab_size)
 
     # Compute loss only on masked positions
     mask = x_t == mask_schedule.mask_token_id  # (B, T)
@@ -187,6 +190,8 @@ def train_step(model, x_0, mask_schedule, optimizer, grad_clip=None):
     weights = (1.0 / timestep_probs).detach()
     weights = weights / weights.mean()
     loss = (per_example * weights).mean()
+    if aux_loss is not None and model.config.moe_aux_loss_weight > 0:
+        loss = loss + model.config.moe_aux_loss_weight * aux_loss
 
     # Backward pass
     optimizer.zero_grad()
@@ -195,7 +200,30 @@ def train_step(model, x_0, mask_schedule, optimizer, grad_clip=None):
         clip_grad_norm_(model.parameters(), grad_clip)
     optimizer.step()
 
-    return loss.item()
+    return loss.item(), router_stats
+
+
+def log_router_histograms(router_stats, step=None):
+    if router_stats is None:
+        return
+    lines = []
+    for layer_idx, hist in enumerate(router_stats):
+        if hist is None:
+            continue
+        counts = hist.detach().to("cpu")
+        counts_list = [int(x) for x in counts.tolist()]
+        total = sum(counts_list)
+        if total > 0:
+            frac_list = [c / total for c in counts_list]
+        else:
+            frac_list = [0.0 for _ in counts_list]
+        count_str = ", ".join(str(c) for c in counts_list)
+        frac_str = ", ".join(f"{f:.2f}" for f in frac_list)
+        lines.append(f"  Layer {layer_idx:02d}: counts [{count_str}] | frac [{frac_str}]")
+    if not lines:
+        return
+    header = f"Router histogram @ step {step}" if step is not None else "Router histogram"
+    tqdm.write("\n".join([header] + lines))
 
 
 def train(
@@ -210,6 +238,7 @@ def train(
     ema_model=None,
     ema_decay=0.999,
     grad_clip=None,
+    router_log_interval=500,
 ):
     """
     Main training loop
@@ -222,7 +251,9 @@ def train(
         x_0 = next(data_loader)
 
         # Training step
-        loss = train_step(model, x_0, mask_schedule, optimizer, grad_clip=grad_clip)
+        loss, router_stats = train_step(
+            model, x_0, mask_schedule, optimizer, grad_clip=grad_clip
+        )
 
         if scheduler is not None:
             scheduler.step()
@@ -231,6 +262,14 @@ def train(
 
         # Update progress bar
         pbar.set_postfix({"loss": f"{loss:.4f}"})
+
+        if (
+            router_stats is not None
+            and router_log_interval is not None
+            and router_log_interval > 0
+            and (step + 1) % router_log_interval == 0
+        ):
+            log_router_histograms(router_stats, step + 1)
 
         # Sample generation
         if (step + 1) % sample_interval == 0:
@@ -357,6 +396,7 @@ def main():
         ema_model=ema_model,
         ema_decay=ema_decay,
         grad_clip=grad_clip,
+        router_log_interval=eval_interval,
     )
 
     # Save model

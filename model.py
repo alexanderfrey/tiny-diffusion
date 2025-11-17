@@ -35,6 +35,11 @@ class DiffusionConfig:
     n_embd: int = 384
     diffusion_steps: int = 128
     context_len: int = 16  # Number of prefix tokens that are never masked
+    num_experts: int = 0  # 0 disables MoE blocks
+    moe_top_k: int = 1
+    moe_capacity_factor: float = 1.25
+    moe_router_jitter: float = 0.0
+    moe_aux_loss_weight: float = 0.01
 
 
 def _functional_rms_norm(x, eps=1e-8):
@@ -114,18 +119,153 @@ class MLP(nn.Module):
         return x
 
 
+class MoEMLP(nn.Module):
+    """
+    Switch-style mixture-of-experts feed-forward layer using top-k routing.
+    """
+
+    def __init__(self, config: DiffusionConfig):
+        super().__init__()
+        if config.num_experts <= 0:
+            raise ValueError("MoEMLP requires num_experts > 0")
+        self.model_dim = config.n_embd
+        self.hidden_dim = 4 * config.n_embd
+        self.num_experts = config.num_experts
+        self.top_k = max(1, min(config.moe_top_k, self.num_experts))
+        self.capacity_factor = config.moe_capacity_factor
+        self.router_jitter = config.moe_router_jitter
+
+        self.router = nn.Linear(self.model_dim, self.num_experts, bias=False)
+
+        self.w1 = nn.Parameter(
+            torch.empty(self.num_experts, self.model_dim, self.hidden_dim)
+        )
+        self.w2 = nn.Parameter(
+            torch.empty(self.num_experts, self.hidden_dim, self.model_dim)
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        fan_in_fc = float(self.model_dim)
+        fan_out_fc = float(self.hidden_dim)
+        std_fc = 1.0 / math.sqrt(fan_in_fc) * min(1.0, math.sqrt(fan_out_fc / fan_in_fc))
+        torch.nn.init.normal_(self.w1, mean=0.0, std=std_fc)
+
+        fan_in_proj = float(self.hidden_dim)
+        fan_out_proj = float(self.model_dim)
+        std_proj = 1.0 / math.sqrt(fan_in_proj) * min(
+            1.0, math.sqrt(fan_out_proj / fan_in_proj)
+        )
+        torch.nn.init.normal_(self.w2, mean=0.0, std=std_proj)
+        torch.nn.init.normal_(self.router.weight, mean=0.0, std=1.0 / math.sqrt(self.model_dim))
+
+    def _compute_capacity(self, num_tokens: int):
+        if num_tokens == 0:
+            return 1
+        approx = math.ceil((num_tokens * self.top_k) / max(1, self.num_experts))
+        capacity = int(math.ceil(self.capacity_factor * approx))
+        return max(1, capacity)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        tokens = x.reshape(-1, C)
+        num_tokens = tokens.size(0)
+        if num_tokens == 0:
+            zeros = x.new_zeros(B, T, C)
+            hist = x.new_zeros(self.num_experts)
+            return zeros, x.new_zeros(()), hist
+
+        router_logits = self.router(tokens)
+        if self.training and self.router_jitter > 0:
+            noise = torch.randn_like(router_logits)
+            router_logits = router_logits + noise * self.router_jitter
+        router_probs = F.softmax(router_logits, dim=-1)
+
+        topk_vals, topk_idx = torch.topk(router_probs, self.top_k, dim=-1)
+        topk_sum = topk_vals.sum(dim=-1, keepdim=True)
+        topk_probs = topk_vals / (topk_sum + 1e-9)
+
+        token_indices = torch.arange(num_tokens, device=x.device).unsqueeze(1).expand(
+            -1, self.top_k
+        )
+        token_indices = token_indices.reshape(-1)
+        expert_indices = topk_idx.reshape(-1)
+        expert_gates = topk_probs.reshape(-1)
+
+        capacity = self._compute_capacity(num_tokens)
+
+        # Determine slot for each (token, expert) pair and drop overflow
+        one_hot = F.one_hot(expert_indices, num_classes=self.num_experts)
+        expert_cumsum = torch.cumsum(one_hot, dim=0) - 1
+        expert_positions = expert_cumsum[
+            torch.arange(expert_indices.size(0), device=x.device), expert_indices
+        ]
+        within_capacity = expert_positions < capacity
+
+        if not within_capacity.any():
+            aux_loss = router_probs.new_zeros(())
+            hist = x.new_zeros(self.num_experts)
+            return x.new_zeros(B, T, C), aux_loss, hist
+
+        token_indices = token_indices[within_capacity]
+        expert_indices = expert_indices[within_capacity]
+        expert_positions = expert_positions[within_capacity]
+        expert_gates = expert_gates[within_capacity]
+
+        expert_inputs = torch.zeros(
+            self.num_experts,
+            capacity,
+            C,
+            dtype=tokens.dtype,
+            device=tokens.device,
+        )
+        expert_inputs[expert_indices, expert_positions] = tokens[token_indices]
+
+        hidden = torch.einsum("ecd,edh->ech", expert_inputs, self.w1)
+        hidden = F.relu(hidden).square()
+        expert_outputs = torch.einsum("ech,eho->eco", hidden, self.w2)
+
+        gathered = expert_outputs[expert_indices, expert_positions]
+        combined = torch.zeros_like(tokens)
+        combined.index_add_(
+            0, token_indices, gathered * expert_gates.unsqueeze(-1)
+        )
+        combined = combined.view(B, T, C)
+
+        # Load balancing loss
+        importance = router_probs.mean(dim=0)
+        load = torch.bincount(expert_indices, minlength=self.num_experts).float()
+        load_sum = load.sum()
+        if load_sum > 0:
+            load = load / load_sum
+        else:
+            load = load * 0.0
+        aux_loss = (importance * load).sum() * self.num_experts
+        gate_hist = torch.bincount(
+            expert_indices, minlength=self.num_experts
+        ).to(tokens.dtype)
+        return combined, aux_loss, gate_hist
+
+
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attn = BidirectionalAttention(config)
-        self.mlp = MLP(config)
+        self.use_moe = config.num_experts > 0
+        self.mlp = MoEMLP(config) if self.use_moe else MLP(config)
         self.attn_norm = RMSNorm(config.n_embd)
         self.mlp_norm = RMSNorm(config.n_embd)
 
     def forward(self, x, cos_sin):
         x = x + self.attn(self.attn_norm(x), cos_sin)
-        x = x + self.mlp(self.mlp_norm(x))
-        return x
+        if self.use_moe:
+            mlp_out, aux_loss, router_hist = self.mlp(self.mlp_norm(x))
+        else:
+            mlp_out = self.mlp(self.mlp_norm(x))
+            aux_loss = None
+            router_hist = None
+        x = x + mlp_out
+        return x, aux_loss, router_hist
 
 
 class DiffusionTransformer(nn.Module):
@@ -200,14 +340,18 @@ class DiffusionTransformer(nn.Module):
     def get_device(self):
         return self.token_emb.weight.device
 
-    def forward(self, x_t, t):
+    def forward(self, x_t, t, return_aux=False, return_router_stats=False):
         """
         Forward pass for diffusion model
         Args:
             x_t: Noisy tokens at timestep t, shape (B, T)
             t: Timestep indices, shape (B,)
+            return_aux: If True, also return auxiliary MoE loss for training
+            return_router_stats: If True, return per-layer router histograms
         Returns:
             logits: Predicted token logits, shape (B, T, vocab_size)
+            aux_loss (optional): Auxiliary MoE loss scalar
+            router_stats (optional): List of per-layer expert histograms
         """
         B, T = x_t.size()
 
@@ -224,13 +368,35 @@ class DiffusionTransformer(nn.Module):
         cos_sin = (self.cos[:, :T], self.sin[:, :T])
 
         # Forward through transformer blocks
+        total_aux_loss = None
+        router_stats = [] if return_router_stats else None
+        has_router_stats = False
         for block in self.blocks:
-            x = block(x, cos_sin)
+            x, block_aux, block_hist = block(x, cos_sin)
+            if block_aux is not None:
+                total_aux_loss = (
+                    block_aux if total_aux_loss is None else total_aux_loss + block_aux
+                )
+            if router_stats is not None:
+                router_stats.append(block_hist)
+                if block_hist is not None:
+                    has_router_stats = True
         x = self.final_norm(x)
 
         # Predict denoised tokens
         logits = self.output_head(x)  # (B, T, vocab_size)
-        return logits
+        outputs = [logits]
+        if return_aux:
+            if total_aux_loss is None:
+                total_aux_loss = logits.new_zeros(())
+            outputs.append(total_aux_loss)
+        if return_router_stats:
+            if router_stats is None or not has_router_stats:
+                router_stats = None
+            outputs.append(router_stats)
+        if len(outputs) == 1:
+            return outputs[0]
+        return tuple(outputs)
 
     @torch.inference_mode()
     def sample_topk(
